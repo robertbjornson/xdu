@@ -5,6 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -94,7 +95,12 @@ fn crawl_directory_for_test(
         let record = FileRecord {
             path: path.to_string_lossy().to_string(),
             size: file_size as i64,
-            atime: 0, // Not testing atime
+            atime: metadata.atime(),
+            mtime: metadata.mtime(),
+            ctime: metadata.ctime(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.mode(),
         };
         buffer.lock().unwrap().add(record);
 

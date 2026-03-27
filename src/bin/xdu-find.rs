@@ -2,10 +2,13 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use clap::Parser;
 use duckdb::Connection;
 
-use xdu::QueryFilters;
+use xdu::{format_bytes, QueryFilters};
+
+const VALID_FIELDS: &[&str] = &["path", "size", "atime", "mtime", "ctime", "uid", "gid", "mode"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,9 +16,10 @@ use xdu::QueryFilters;
     about = "Query a file metadata index for matching paths",
     after_help = "Examples:
   xdu-find -i /index/scratch -p '\\.py$' --min-size 1M
-  xdu-find -i /index/scratch --older-than 90 -f size
+  xdu-find -i /index/scratch --older-than 90 -f path,size,atime
   xdu-find -i /index/scratch -u alice --count
-  xdu-find -i /index/scratch --top 10"
+  xdu-find -i /index/scratch --top 10
+  xdu-find -i /index/scratch -f path,size,mtime,uid --csv"
 )]
 struct Args {
     /// Path to the Parquet index directory
@@ -46,9 +50,41 @@ struct Args {
     #[arg(long, value_name = "DAYS")]
     newer_than: Option<u64>,
 
-    /// Output format: path (default), size, atime, csv, json
-    #[arg(short, long, default_value = "path")]
+    /// Files not modified in N days
+    #[arg(long, value_name = "DAYS")]
+    modified_older_than: Option<u64>,
+
+    /// Files modified within N days
+    #[arg(long, value_name = "DAYS")]
+    modified_newer_than: Option<u64>,
+
+    /// Files whose ctime is older than N days
+    #[arg(long, value_name = "DAYS")]
+    changed_older_than: Option<u64>,
+
+    /// Files whose ctime is within N days
+    #[arg(long, value_name = "DAYS")]
+    changed_newer_than: Option<u64>,
+
+    /// Filter by owner user ID
+    #[arg(long, value_name = "UID")]
+    uid: Option<u32>,
+
+    /// Filter by owner group ID
+    #[arg(long, value_name = "GID")]
+    gid: Option<u32>,
+
+    /// Filter by exact file mode bits (decimal integer, e.g. 33188 for 0o100644)
+    #[arg(long, value_name = "MODE")]
+    mode: Option<u32>,
+
+    /// Comma-separated list of fields to output: path, size, atime, mtime, ctime, uid, gid, mode
+    #[arg(short, long, default_value = "path", value_name = "FIELDS")]
     format: String,
+
+    /// Output as CSV with a header row (raw values). Default is human-readable tab-separated.
+    #[arg(long)]
+    csv: bool,
 
     /// Limit number of results
     #[arg(short, long)]
@@ -63,15 +99,70 @@ struct Args {
     top: Option<usize>,
 }
 
+/// Format a Unix epoch timestamp as "YYYY-MM-DD HH:MM:SS".
+fn format_timestamp(epoch: i64) -> String {
+    match DateTime::from_timestamp(epoch, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => epoch.to_string(),
+    }
+}
+
+/// Escape and quote a value for CSV output if needed.
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Read and format a single field value from a DuckDB row.
+fn read_field(field: &str, row: &duckdb::Row, col_idx: usize, human: bool) -> Result<String> {
+    Ok(match field {
+        "path" => {
+            let v: String = row.get(col_idx)?;
+            v
+        }
+        "size" => {
+            let v: i64 = row.get(col_idx)?;
+            if human { format_bytes(v as u64) } else { v.to_string() }
+        }
+        "atime" | "mtime" | "ctime" => {
+            let v: i64 = row.get(col_idx)?;
+            if human { format_timestamp(v) } else { v.to_string() }
+        }
+        "uid" | "gid" => {
+            let v: i32 = row.get(col_idx)?;
+            v.to_string()
+        }
+        "mode" => {
+            let v: i32 = row.get(col_idx)?;
+            if human { format!("{:o}", v) } else { v.to_string() }
+        }
+        _ => unreachable!("field validated earlier: {}", field),
+    })
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Parse and validate field list
+    let fields: Vec<&str> = args.format.split(',').map(|s| s.trim()).collect();
+    for f in &fields {
+        if !VALID_FIELDS.contains(f) {
+            anyhow::bail!(
+                "Unknown field '{}'. Valid fields: {}",
+                f,
+                VALID_FIELDS.join(", ")
+            );
+        }
+    }
 
     // Resolve index path
     let index_path = args.index.canonicalize()
         .with_context(|| format!("Index directory not found: {}", args.index.display()))?;
 
     // Build the glob pattern for Parquet files
-    // Partitions are direct children of the index directory
     let glob_pattern = if let Some(ref partition) = args.partition {
         format!("{}/{}/*.parquet", index_path.display(), partition)
     } else {
@@ -81,11 +172,18 @@ fn main() -> Result<()> {
     // Connect to DuckDB (in-memory)
     let conn = Connection::open_in_memory()?;
 
-    // Build filters using shared QueryFilters
+    // Build filters
     let filters = QueryFilters::new()
         .with_pattern(args.pattern.clone())
         .with_older_than(args.older_than)
         .with_newer_than(args.newer_than)
+        .with_mtime_older_than(args.modified_older_than)
+        .with_mtime_newer_than(args.modified_newer_than)
+        .with_ctime_older_than(args.changed_older_than)
+        .with_ctime_newer_than(args.changed_newer_than)
+        .with_uid(args.uid)
+        .with_gid(args.gid)
+        .with_mode(args.mode)
         .with_min_size(args.min_size.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?
         .with_max_size(args.max_size.as_deref())
@@ -99,16 +197,13 @@ fn main() -> Result<()> {
         String::new()
     };
 
-    // Build and execute query based on format
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    // Handle --top mode: show top N partitions by file count
+    // --top mode
     if let Some(n) = args.top {
-        // Extract partition name from the path (parent directory of the parquet file)
-        // The glob pattern is index/*/*.parquet, so we extract the partition from the path
         let sql = format!(
-            "SELECT 
+            "SELECT
                 regexp_extract(filename, '.*/([^/]+)/[^/]+\\.parquet$', 1) as partition,
                 COUNT(*) as file_count
             FROM read_parquet('{}', filename=true) {}
@@ -126,7 +221,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Handle count mode
+    // --count mode
     if args.count {
         let sql = format!(
             "SELECT COUNT(*) FROM read_parquet('{}') {}",
@@ -141,96 +236,37 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    match args.format.as_str() {
-        "path" => {
-            let sql = format!(
-                "SELECT path FROM read_parquet('{}') {} {}",
-                glob_pattern, where_clause, limit_clause
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                writeln!(out, "{}", path)?;
-            }
+    // Build SELECT query from requested fields
+    let select_clause = fields.join(", ");
+    let sql = format!(
+        "SELECT {} FROM read_parquet('{}') {} {}",
+        select_clause, glob_pattern, where_clause, limit_clause
+    );
+
+    let human = !args.csv;
+
+    // CSV header
+    if args.csv {
+        writeln!(out, "{}", fields.join(","))?;
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let mut values = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let v = read_field(field, row, i, human)?;
+            values.push(v);
         }
-        "size" => {
-            let sql = format!(
-                "SELECT path, size FROM read_parquet('{}') {} ORDER BY size DESC {}",
-                glob_pattern, where_clause, limit_clause
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                let size: i64 = row.get(1)?;
-                writeln!(out, "{}\t{}", size, path)?;
-            }
-        }
-        "atime" => {
-            let sql = format!(
-                "SELECT path, atime FROM read_parquet('{}') {} ORDER BY atime ASC {}",
-                glob_pattern, where_clause, limit_clause
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                let atime: i64 = row.get(1)?;
-                writeln!(out, "{}\t{}", atime, path)?;
-            }
-        }
-        "csv" => {
-            let sql = format!(
-                "SELECT path, size, atime FROM read_parquet('{}') {} {}",
-                glob_pattern, where_clause, limit_clause
-            );
-            writeln!(out, "path,size,atime")?;
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                let size: i64 = row.get(1)?;
-                let atime: i64 = row.get(2)?;
-                // Escape commas and quotes in path for CSV
-                if path.contains(',') || path.contains('"') {
-                    writeln!(out, "\"{}\",{},{}", path.replace('"', "\"\""), size, atime)?;
-                } else {
-                    writeln!(out, "{},{},{}", path, size, atime)?;
-                }
-            }
-        }
-        "json" => {
-            let sql = format!(
-                "SELECT path, size, atime FROM read_parquet('{}') {} {}",
-                glob_pattern, where_clause, limit_clause
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            let mut first = true;
-            writeln!(out, "[")?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                let size: i64 = row.get(1)?;
-                let atime: i64 = row.get(2)?;
-                if !first {
-                    writeln!(out, ",")?;
-                }
-                first = false;
-                // Escape JSON special characters in path
-                let escaped_path = path
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t");
-                write!(out, "  {{\"path\":\"{}\",\"size\":{},\"atime\":{}}}", escaped_path, size, atime)?;
-            }
-            writeln!(out)?;
-            writeln!(out, "]")?;
-        }
-        _ => {
-            anyhow::bail!("Unknown format: {}. Use: path, size, atime, csv, json", args.format);
+
+        if args.csv {
+            let escaped: Vec<String> = fields.iter().zip(values.iter()).map(|(f, v)| {
+                if *f == "path" { csv_escape(v) } else { v.clone() }
+            }).collect();
+            writeln!(out, "{}", escaped.join(","))?;
+        } else {
+            writeln!(out, "{}", values.join("\t"))?;
         }
     }
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use arrow::array::{Int64Array, StringBuilder};
+use arrow::array::{Int32Array, Int64Array, StringBuilder};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
@@ -126,13 +126,23 @@ impl PartitionBuffer {
         let partial_path = partition_dir.join(format!("{:06}.parquet.partial", chunk_id));
 
         let mut path_builder = StringBuilder::new();
-        let mut size_builder = Vec::with_capacity(self.records.len());
+        let mut size_builder  = Vec::with_capacity(self.records.len());
         let mut atime_builder = Vec::with_capacity(self.records.len());
+        let mut mtime_builder = Vec::with_capacity(self.records.len());
+        let mut ctime_builder = Vec::with_capacity(self.records.len());
+        let mut uid_builder   = Vec::with_capacity(self.records.len());
+        let mut gid_builder   = Vec::with_capacity(self.records.len());
+        let mut mode_builder  = Vec::with_capacity(self.records.len());
 
         for record in &self.records {
             path_builder.append_value(&record.path);
             size_builder.push(record.size);
             atime_builder.push(record.atime);
+            mtime_builder.push(record.mtime);
+            ctime_builder.push(record.ctime);
+            uid_builder.push(record.uid as i32);
+            gid_builder.push(record.gid as i32);
+            mode_builder.push(record.mode as i32);
         }
 
         let batch = RecordBatch::try_new(
@@ -141,6 +151,11 @@ impl PartitionBuffer {
                 Arc::new(path_builder.finish()),
                 Arc::new(Int64Array::from(size_builder)),
                 Arc::new(Int64Array::from(atime_builder)),
+                Arc::new(Int64Array::from(mtime_builder)),
+                Arc::new(Int64Array::from(ctime_builder)),
+                Arc::new(Int32Array::from(uid_builder)),
+                Arc::new(Int32Array::from(gid_builder)),
+                Arc::new(Int32Array::from(mode_builder)),
             ],
         )?;
 
@@ -398,12 +413,22 @@ fn crawl(
                             let disk_usage = metadata.blocks() * 512;
                             let file_len = metadata.len();
                             let atime = metadata.atime();
+                            let mtime = metadata.mtime();
+                            let ctime = metadata.ctime();
+                            let uid   = metadata.uid();
+                            let gid   = metadata.gid();
+                            let mode  = metadata.mode();
                             let file_size = size_mode.calculate(disk_usage, file_len);
 
                             let record = FileRecord {
                                 path: entry.path().to_string_lossy().to_string(),
                                 size: file_size as i64,
                                 atime,
+                                mtime,
+                                ctime,
+                                uid,
+                                gid,
+                                mode,
                             };
 
                             buffer.add(record)?;

@@ -13,6 +13,11 @@ pub struct FileRecord {
     pub path: String,
     pub size: i64,
     pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
 }
 
 /// Round size up to the nearest block boundary.
@@ -96,11 +101,25 @@ pub enum SortMode {
     AgeDesc,
     /// By age (newest first - most recent access)
     AgeAsc,
+    /// By mtime (oldest first)
+    MtimeDesc,
+    /// By mtime (newest first)
+    MtimeAsc,
+    /// By ctime (oldest first)
+    CtimeDesc,
+    /// By ctime (newest first)
+    CtimeAsc,
+    /// By uid, ascending
+    UidAsc,
+    /// By gid, ascending
+    GidAsc,
+    /// By mode, ascending
+    ModeAsc,
 }
 
 impl SortMode {
     /// All sort modes in display order.
-    pub const ALL: [SortMode; 7] = [
+    pub const ALL: [SortMode; 14] = [
         SortMode::Name,
         SortMode::SizeDesc,
         SortMode::SizeAsc,
@@ -108,6 +127,13 @@ impl SortMode {
         SortMode::CountAsc,
         SortMode::AgeDesc,
         SortMode::AgeAsc,
+        SortMode::MtimeDesc,
+        SortMode::MtimeAsc,
+        SortMode::CtimeDesc,
+        SortMode::CtimeAsc,
+        SortMode::UidAsc,
+        SortMode::GidAsc,
+        SortMode::ModeAsc,
     ];
 
     /// Returns the next sort mode in the cycle.
@@ -119,20 +145,34 @@ impl SortMode {
             SortMode::CountDesc => SortMode::CountAsc,
             SortMode::CountAsc => SortMode::AgeDesc,
             SortMode::AgeDesc => SortMode::AgeAsc,
-            SortMode::AgeAsc => SortMode::Name,
+            SortMode::AgeAsc => SortMode::MtimeDesc,
+            SortMode::MtimeDesc => SortMode::MtimeAsc,
+            SortMode::MtimeAsc => SortMode::CtimeDesc,
+            SortMode::CtimeDesc => SortMode::CtimeAsc,
+            SortMode::CtimeAsc => SortMode::UidAsc,
+            SortMode::UidAsc => SortMode::GidAsc,
+            SortMode::GidAsc => SortMode::ModeAsc,
+            SortMode::ModeAsc => SortMode::Name,
         }
     }
 
     /// Returns the previous sort mode in the cycle.
     pub fn prev(self) -> Self {
         match self {
-            SortMode::Name => SortMode::AgeAsc,
+            SortMode::Name => SortMode::ModeAsc,
             SortMode::SizeDesc => SortMode::Name,
             SortMode::SizeAsc => SortMode::SizeDesc,
             SortMode::CountDesc => SortMode::SizeAsc,
             SortMode::CountAsc => SortMode::CountDesc,
             SortMode::AgeDesc => SortMode::CountAsc,
             SortMode::AgeAsc => SortMode::AgeDesc,
+            SortMode::MtimeDesc => SortMode::AgeAsc,
+            SortMode::MtimeAsc => SortMode::MtimeDesc,
+            SortMode::CtimeDesc => SortMode::MtimeAsc,
+            SortMode::CtimeAsc => SortMode::CtimeDesc,
+            SortMode::UidAsc => SortMode::CtimeAsc,
+            SortMode::GidAsc => SortMode::UidAsc,
+            SortMode::ModeAsc => SortMode::GidAsc,
         }
     }
 
@@ -148,6 +188,13 @@ impl SortMode {
             SortMode::CountAsc => "file_count ASC",
             SortMode::AgeDesc => "latest_atime ASC",   // oldest first = smallest atime
             SortMode::AgeAsc => "latest_atime DESC",   // newest first = largest atime
+            SortMode::MtimeDesc => "latest_mtime ASC",
+            SortMode::MtimeAsc  => "latest_mtime DESC",
+            SortMode::CtimeDesc => "latest_ctime ASC",
+            SortMode::CtimeAsc  => "latest_ctime DESC",
+            SortMode::UidAsc    => "min_uid ASC",
+            SortMode::GidAsc    => "min_gid ASC",
+            SortMode::ModeAsc   => "min_mode ASC",
         }
     }
 
@@ -159,8 +206,15 @@ impl SortMode {
             SortMode::SizeAsc => "total_size ASC",
             SortMode::CountDesc => "file_count DESC",
             SortMode::CountAsc => "file_count ASC",
-            SortMode::AgeDesc => "latest_atime ASC",   // oldest first
-            SortMode::AgeAsc => "latest_atime DESC",   // newest first
+            SortMode::AgeDesc => "latest_atime ASC",
+            SortMode::AgeAsc => "latest_atime DESC",
+            SortMode::MtimeDesc => "latest_mtime ASC",
+            SortMode::MtimeAsc  => "latest_mtime DESC",
+            SortMode::CtimeDesc => "latest_ctime ASC",
+            SortMode::CtimeAsc  => "latest_ctime DESC",
+            SortMode::UidAsc    => "min_uid ASC",
+            SortMode::GidAsc    => "min_gid ASC",
+            SortMode::ModeAsc   => "min_mode ASC",
         }
     }
 }
@@ -175,6 +229,13 @@ impl fmt::Display for SortMode {
             SortMode::CountAsc => write!(f, "count-asc"),
             SortMode::AgeDesc => write!(f, "age-desc"),
             SortMode::AgeAsc => write!(f, "age-asc"),
+            SortMode::MtimeDesc => write!(f, "mtime-desc"),
+            SortMode::MtimeAsc  => write!(f, "mtime-asc"),
+            SortMode::CtimeDesc => write!(f, "ctime-desc"),
+            SortMode::CtimeAsc  => write!(f, "ctime-asc"),
+            SortMode::UidAsc    => write!(f, "uid-asc"),
+            SortMode::GidAsc    => write!(f, "gid-asc"),
+            SortMode::ModeAsc   => write!(f, "mode-asc"),
         }
     }
 }
@@ -191,7 +252,14 @@ impl FromStr for SortMode {
             "count-asc" => Ok(SortMode::CountAsc),
             "age-desc" | "age" | "oldest" => Ok(SortMode::AgeDesc),
             "age-asc" | "newest" => Ok(SortMode::AgeAsc),
-            _ => Err(format!("Invalid sort mode: {}. Use: name, size-desc, size-asc, count-desc, count-asc, age-desc, age-asc", s)),
+            "mtime-desc" | "mtime" => Ok(SortMode::MtimeDesc),
+            "mtime-asc" => Ok(SortMode::MtimeAsc),
+            "ctime-desc" | "ctime" => Ok(SortMode::CtimeDesc),
+            "ctime-asc" => Ok(SortMode::CtimeAsc),
+            "uid-asc" | "uid" => Ok(SortMode::UidAsc),
+            "gid-asc" | "gid" => Ok(SortMode::GidAsc),
+            "mode-asc" | "mode" => Ok(SortMode::ModeAsc),
+            _ => Err(format!("Invalid sort mode: {}. Use: name, size-desc, size-asc, count-desc, count-asc, age-desc, age-asc, mtime-desc, mtime-asc, ctime-desc, ctime-asc, uid-asc, gid-asc, mode-asc", s)),
         }
     }
 }
@@ -209,6 +277,20 @@ pub struct QueryFilters {
     pub older_than: Option<i64>,
     /// Files accessed since this epoch timestamp.
     pub newer_than: Option<i64>,
+    /// Files not modified since this epoch timestamp.
+    pub mtime_older_than: Option<i64>,
+    /// Files modified since this epoch timestamp.
+    pub mtime_newer_than: Option<i64>,
+    /// Files whose ctime is before this epoch timestamp.
+    pub ctime_older_than: Option<i64>,
+    /// Files whose ctime is since this epoch timestamp.
+    pub ctime_newer_than: Option<i64>,
+    /// Filter by exact owner user ID.
+    pub uid: Option<u32>,
+    /// Filter by exact owner group ID.
+    pub gid: Option<u32>,
+    /// Filter by exact file mode bits.
+    pub mode: Option<u32>,
 }
 
 impl QueryFilters {
@@ -259,6 +341,72 @@ impl QueryFilters {
         self
     }
 
+    /// Set mtime-older-than filter from days.
+    pub fn with_mtime_older_than(mut self, days: Option<u64>) -> Self {
+        if let Some(d) = days {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            self.mtime_older_than = Some(now - (d as i64 * 86400));
+        }
+        self
+    }
+
+    /// Set mtime-newer-than filter from days.
+    pub fn with_mtime_newer_than(mut self, days: Option<u64>) -> Self {
+        if let Some(d) = days {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            self.mtime_newer_than = Some(now - (d as i64 * 86400));
+        }
+        self
+    }
+
+    /// Set ctime-older-than filter from days.
+    pub fn with_ctime_older_than(mut self, days: Option<u64>) -> Self {
+        if let Some(d) = days {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            self.ctime_older_than = Some(now - (d as i64 * 86400));
+        }
+        self
+    }
+
+    /// Set ctime-newer-than filter from days.
+    pub fn with_ctime_newer_than(mut self, days: Option<u64>) -> Self {
+        if let Some(d) = days {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            self.ctime_newer_than = Some(now - (d as i64 * 86400));
+        }
+        self
+    }
+
+    /// Set uid filter.
+    pub fn with_uid(mut self, uid: Option<u32>) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    /// Set gid filter.
+    pub fn with_gid(mut self, gid: Option<u32>) -> Self {
+        self.gid = gid;
+        self
+    }
+
+    /// Set mode filter (exact match).
+    pub fn with_mode(mut self, mode: Option<u32>) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// Returns true if any filter is active.
     pub fn is_active(&self) -> bool {
         self.pattern.is_some()
@@ -266,6 +414,13 @@ impl QueryFilters {
             || self.max_size.is_some()
             || self.older_than.is_some()
             || self.newer_than.is_some()
+            || self.mtime_older_than.is_some()
+            || self.mtime_newer_than.is_some()
+            || self.ctime_older_than.is_some()
+            || self.ctime_newer_than.is_some()
+            || self.uid.is_some()
+            || self.gid.is_some()
+            || self.mode.is_some()
     }
 
     /// Returns individual WHERE clause conditions.
@@ -291,6 +446,34 @@ impl QueryFilters {
 
         if let Some(threshold) = self.newer_than {
             conditions.push(format!("atime >= {}", threshold));
+        }
+
+        if let Some(threshold) = self.mtime_older_than {
+            conditions.push(format!("mtime < {}", threshold));
+        }
+
+        if let Some(threshold) = self.mtime_newer_than {
+            conditions.push(format!("mtime >= {}", threshold));
+        }
+
+        if let Some(threshold) = self.ctime_older_than {
+            conditions.push(format!("ctime < {}", threshold));
+        }
+
+        if let Some(threshold) = self.ctime_newer_than {
+            conditions.push(format!("ctime >= {}", threshold));
+        }
+
+        if let Some(uid) = self.uid {
+            conditions.push(format!("uid = {}", uid));
+        }
+
+        if let Some(gid) = self.gid {
+            conditions.push(format!("gid = {}", gid));
+        }
+
+        if let Some(mode) = self.mode {
+            conditions.push(format!("mode = {}", mode));
         }
 
         conditions
@@ -325,6 +508,13 @@ impl QueryFilters {
         self.max_size = None;
         self.older_than = None;
         self.newer_than = None;
+        self.mtime_older_than = None;
+        self.mtime_newer_than = None;
+        self.ctime_older_than = None;
+        self.ctime_newer_than = None;
+        self.uid = None;
+        self.gid = None;
+        self.mode = None;
     }
 
     /// Format active filters for display (e.g., "[older:30d] [min:1M]").
@@ -361,6 +551,54 @@ impl QueryFilters {
             parts.push(format!("[newer:{}d]", days));
         }
 
+        if let Some(threshold) = self.mtime_older_than {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let days = (now - threshold) / 86400;
+            parts.push(format!("[mtime-older:{}d]", days));
+        }
+
+        if let Some(threshold) = self.mtime_newer_than {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let days = (now - threshold) / 86400;
+            parts.push(format!("[mtime-newer:{}d]", days));
+        }
+
+        if let Some(threshold) = self.ctime_older_than {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let days = (now - threshold) / 86400;
+            parts.push(format!("[ctime-older:{}d]", days));
+        }
+
+        if let Some(threshold) = self.ctime_newer_than {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let days = (now - threshold) / 86400;
+            parts.push(format!("[ctime-newer:{}d]", days));
+        }
+
+        if let Some(uid) = self.uid {
+            parts.push(format!("[uid:{}]", uid));
+        }
+
+        if let Some(gid) = self.gid {
+            parts.push(format!("[gid:{}]", gid));
+        }
+
+        if let Some(mode) = self.mode {
+            parts.push(format!("[mode:{:o}]", mode));
+        }
+
         parts.join(" ")
     }
 }
@@ -368,9 +606,14 @@ impl QueryFilters {
 /// Returns the Arrow schema for file metadata records.
 pub fn get_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("path", DataType::Utf8, false),
-        Field::new("size", DataType::Int64, false),
+        Field::new("path",  DataType::Utf8,  false),
+        Field::new("size",  DataType::Int64, false),
         Field::new("atime", DataType::Int64, false),
+        Field::new("mtime", DataType::Int64, false),
+        Field::new("ctime", DataType::Int64, false),
+        Field::new("uid",   DataType::Int32, false),
+        Field::new("gid",   DataType::Int32, false),
+        Field::new("mode",  DataType::Int32, false),
     ]))
 }
 
@@ -506,10 +749,15 @@ mod tests {
     #[test]
     fn test_schema_fields() {
         let schema = get_schema();
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).name(), "path");
         assert_eq!(schema.field(1).name(), "size");
         assert_eq!(schema.field(2).name(), "atime");
+        assert_eq!(schema.field(3).name(), "mtime");
+        assert_eq!(schema.field(4).name(), "ctime");
+        assert_eq!(schema.field(5).name(), "uid");
+        assert_eq!(schema.field(6).name(), "gid");
+        assert_eq!(schema.field(7).name(), "mode");
     }
 
     // SizeMode::calculate() tests
@@ -592,11 +840,21 @@ mod tests {
             path: "/data/users/alice/file.txt".to_string(),
             size: 1024,
             atime: 1700000000,
+            mtime: 1699000000,
+            ctime: 1698000000,
+            uid: 1001,
+            gid: 1001,
+            mode: 0o100644,
         };
 
         assert_eq!(record.path, "/data/users/alice/file.txt");
         assert_eq!(record.size, 1024);
         assert_eq!(record.atime, 1700000000);
+        assert_eq!(record.mtime, 1699000000);
+        assert_eq!(record.ctime, 1698000000);
+        assert_eq!(record.uid, 1001);
+        assert_eq!(record.gid, 1001);
+        assert_eq!(record.mode, 0o100644);
     }
 
     #[test]
@@ -605,16 +863,31 @@ mod tests {
             path: "/data/file.txt".to_string(),
             size: 100,
             atime: 1000,
+            mtime: 900,
+            ctime: 800,
+            uid: 0,
+            gid: 0,
+            mode: 0o100644,
         };
         let record2 = FileRecord {
             path: "/data/file.txt".to_string(),
             size: 100,
             atime: 1000,
+            mtime: 900,
+            ctime: 800,
+            uid: 0,
+            gid: 0,
+            mode: 0o100644,
         };
         let record3 = FileRecord {
             path: "/data/other.txt".to_string(),
             size: 100,
             atime: 1000,
+            mtime: 900,
+            ctime: 800,
+            uid: 0,
+            gid: 0,
+            mode: 0o100644,
         };
 
         assert_eq!(record1, record2);
@@ -627,6 +900,11 @@ mod tests {
             path: "/data/file.txt".to_string(),
             size: 2048,
             atime: 1600000000,
+            mtime: 1599000000,
+            ctime: 1598000000,
+            uid: 500,
+            gid: 500,
+            mode: 0o100755,
         };
         let cloned = record.clone();
 
@@ -695,7 +973,14 @@ mod tests {
         assert_eq!(SortMode::CountDesc.next(), SortMode::CountAsc);
         assert_eq!(SortMode::CountAsc.next(), SortMode::AgeDesc);
         assert_eq!(SortMode::AgeDesc.next(), SortMode::AgeAsc);
-        assert_eq!(SortMode::AgeAsc.next(), SortMode::Name);
+        assert_eq!(SortMode::AgeAsc.next(), SortMode::MtimeDesc);
+        assert_eq!(SortMode::MtimeDesc.next(), SortMode::MtimeAsc);
+        assert_eq!(SortMode::MtimeAsc.next(), SortMode::CtimeDesc);
+        assert_eq!(SortMode::CtimeDesc.next(), SortMode::CtimeAsc);
+        assert_eq!(SortMode::CtimeAsc.next(), SortMode::UidAsc);
+        assert_eq!(SortMode::UidAsc.next(), SortMode::GidAsc);
+        assert_eq!(SortMode::GidAsc.next(), SortMode::ModeAsc);
+        assert_eq!(SortMode::ModeAsc.next(), SortMode::Name);
     }
 
     #[test]
