@@ -18,6 +18,7 @@ chrono = "0.4"
 infer = "0.19"
 ratatui = "0.29"
 crossterm = "0.28"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -38,6 +39,10 @@ path = "src/bin/xdu-view.rs"
 [[bin]]
 name = "xdu-rm"
 path = "src/bin/xdu-rm.rs"
+
+[[bin]]
+name = "xdu-du"
+path = "src/bin/xdu-du.rs"
 
 [profile.release]
 lto = true

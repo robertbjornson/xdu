@@ -1,10 +1,11 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::collapsible_else_if)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -301,14 +302,76 @@ fn describe_text_by_extension(path: &str) -> Option<&'static str> {
     Some(desc)
 }
 
-/// Format a uid value for display ("-" for directories/parent entry).
-fn format_uid(uid: i32, is_dir: bool) -> String {
-    if is_dir || uid < 0 { "-".to_string() } else { uid.to_string() }
+/// Resolve a uid to a username using getpwuid_r, with a process-lifetime cache.
+fn resolve_username(uid: i32) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(name) = map.get(&uid) {
+        return name.clone();
+    }
+    let name = unsafe {
+        let mut buf = vec![0i8; 4096];
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        );
+        if !result.is_null() {
+            std::ffi::CStr::from_ptr((*result).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            uid.to_string()
+        }
+    };
+    map.insert(uid, name.clone());
+    name
 }
 
-/// Format a gid value for display ("-" for directories/parent entry).
-fn format_gid(gid: i32, is_dir: bool) -> String {
-    if is_dir || gid < 0 { "-".to_string() } else { gid.to_string() }
+/// Resolve a gid to a group name using getgrgid_r, with a process-lifetime cache.
+fn resolve_groupname(gid: i32) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(name) = map.get(&gid) {
+        return name.clone();
+    }
+    let name = unsafe {
+        let mut buf = vec![0i8; 4096];
+        let mut grp: libc::group = std::mem::zeroed();
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        libc::getgrgid_r(
+            gid as libc::gid_t,
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        );
+        if !result.is_null() {
+            std::ffi::CStr::from_ptr((*result).gr_name)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            gid.to_string()
+        }
+    };
+    map.insert(gid, name.clone());
+    name
+}
+
+/// Format a uid as username ("-" for the parent entry sentinel).
+fn format_uid(uid: i32, _is_dir: bool) -> String {
+    if uid < 0 { "-".to_string() } else { resolve_username(uid) }
+}
+
+/// Format a gid as group name ("-" for the parent entry sentinel).
+fn format_gid(gid: i32, _is_dir: bool) -> String {
+    if gid < 0 { "-".to_string() } else { resolve_groupname(gid) }
 }
 
 /// Format a mode value in octal ("-" for directories/parent entry).
@@ -788,8 +851,8 @@ impl App {
                     SUM(CASE WHEN {filter} THEN 1 ELSE 0 END) as file_count,
                     MAX(CASE WHEN {filter} THEN mtime ELSE 0 END) as latest_mtime,
                     MAX(CASE WHEN {filter} THEN ctime ELSE 0 END) as latest_ctime,
-                    MIN(uid) as min_uid,
-                    MIN(gid) as min_gid,
+                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                     MIN(mode) as min_mode
                 FROM read_parquet('{glob}', filename=true)
                 GROUP BY partition
@@ -811,8 +874,8 @@ impl App {
                     COUNT(*) as file_count,
                     MAX(mtime) as latest_mtime,
                     MAX(ctime) as latest_ctime,
-                    MIN(uid) as min_uid,
-                    MIN(gid) as min_gid,
+                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                     MIN(mode) as min_mode
                 FROM read_parquet('{glob}', filename=true)
                 GROUP BY partition
@@ -951,8 +1014,8 @@ impl App {
                 MAX(atime) as latest_atime,
                 MAX(mtime) as latest_mtime,
                 MAX(ctime) as latest_ctime,
-                MIN(uid) as min_uid,
-                MIN(gid) as min_gid,
+                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                 MIN(mode) as min_mode
             FROM components
             WHERE component != '' AND component IS NOT NULL
@@ -1312,8 +1375,8 @@ impl App {
                     SUM(CASE WHEN {filter} THEN 1 ELSE 0 END) as file_count,
                     MAX(CASE WHEN {filter} THEN mtime ELSE 0 END) as latest_mtime,
                     MAX(CASE WHEN {filter} THEN ctime ELSE 0 END) as latest_ctime,
-                    MIN(uid) as min_uid,
-                    MIN(gid) as min_gid,
+                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                     MIN(mode) as min_mode
                 FROM read_parquet('{glob}', filename=true)
                 GROUP BY partition
@@ -1335,8 +1398,8 @@ impl App {
                     COUNT(*) as file_count,
                     MAX(mtime) as latest_mtime,
                     MAX(ctime) as latest_ctime,
-                    MIN(uid) as min_uid,
-                    MIN(gid) as min_gid,
+                    CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                    CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                     MIN(mode) as min_mode
                 FROM read_parquet('{glob}', filename=true)
                 GROUP BY partition
@@ -1455,8 +1518,8 @@ impl App {
                 MAX(atime) as latest_atime,
                 MAX(mtime) as latest_mtime,
                 MAX(ctime) as latest_ctime,
-                MIN(uid) as min_uid,
-                MIN(gid) as min_gid,
+                CASE WHEN MIN(uid) = MAX(uid) THEN MIN(uid) ELSE -1 END as min_uid,
+                CASE WHEN MIN(gid) = MAX(gid) THEN MIN(gid) ELSE -1 END as min_gid,
                 MIN(mode) as min_mode
             FROM components
             WHERE component != '' AND component IS NOT NULL
@@ -2321,8 +2384,8 @@ fn render_help_overlay(f: &mut Frame) {
         ]),
         Line::from("──────────────────────  ──────────────────────────"),
         Line::from(vec![Span::raw("j/↓  next               "), Span::styled("t", Style::default().fg(Color::Cyan)), Span::raw("   cycle timestamp (accessed/modified/changed)")]),
-        Line::from(vec![Span::raw("k/↑  prev               "), Span::styled("u", Style::default().fg(Color::Cyan)), Span::raw("   toggle uid column")]),
-        Line::from(vec![Span::raw("PgUp first              "), Span::styled("g", Style::default().fg(Color::Cyan)), Span::raw("   toggle gid column")]),
+        Line::from(vec![Span::raw("k/↑  prev               "), Span::styled("u", Style::default().fg(Color::Cyan)), Span::raw("   toggle user column")]),
+        Line::from(vec![Span::raw("PgUp first              "), Span::styled("g", Style::default().fg(Color::Cyan)), Span::raw("   toggle group column")]),
         Line::from(vec![Span::raw("PgDn last               "), Span::styled("x", Style::default().fg(Color::Cyan)), Span::raw("   toggle mode column")]),
         Line::from(vec![Span::raw("←/BS up / collapse      "), Span::styled("s", Style::default().fg(Color::Cyan)), Span::raw("   sort selector")]),
         Line::from(vec![Span::raw("→/Enter enter/expand    "), Span::styled("/", Style::default().fg(Color::Cyan)), Span::raw("   filter by pattern")]),
@@ -2415,8 +2478,8 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
     let size_width  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(10);
     let count_width = formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(8);
     let ts_width    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(12);
-    let uid_width   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max(5) } else { 0 };
-    let gid_width   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max(5) } else { 0 };
+    let uid_width   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max(4).max("user".len()) } else { 0 };
+    let gid_width   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max(5).max("group".len()) } else { 0 };
     let mode_width  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(6) } else { 0 };
 
     let extra_cols = [uid_width, gid_width, mode_width].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
@@ -2458,9 +2521,9 @@ fn render_list_content(f: &mut Frame, app: &App, area: Rect) {
         count_width = count_width,
         ts_width = ts_width,
     );
-    if app.visible_extras.uid  { header += &format!("  {:>uid_width$}",  "uid",  uid_width  = uid_width);  }
-    if app.visible_extras.gid  { header += &format!("  {:>gid_width$}",  "gid",  gid_width  = gid_width);  }
-    if app.visible_extras.mode { header += &format!("  {:>mode_width$}", "mode", mode_width = mode_width); }
+    if app.visible_extras.uid  { header += &format!("  {:>uid_width$}",  "user",  uid_width  = uid_width);  }
+    if app.visible_extras.gid  { header += &format!("  {:>gid_width$}",  "group", gid_width  = gid_width);  }
+    if app.visible_extras.mode { header += &format!("  {:>mode_width$}", "mode",  mode_width = mode_width); }
 
     // Render block separately so we can split the inner area
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -2591,8 +2654,8 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
         let size_w  = formatted.iter().map(|f| f.size.len()).max().unwrap_or(0).max(6);
         let count_w = formatted.iter().map(|f| f.count.len()).max().unwrap_or(0).max(6);
         let ts_w    = formatted.iter().map(|f| f.ts.len()).max().unwrap_or(0).max(6);
-        let uid_w   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max(4) } else { 0 };
-        let gid_w   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max(4) } else { 0 };
+        let uid_w   = if app.visible_extras.uid  { formatted.iter().map(|f| f.uid.len()).max().unwrap_or(0).max("user".len()) } else { 0 };
+        let gid_w   = if app.visible_extras.gid  { formatted.iter().map(|f| f.gid.len()).max().unwrap_or(0).max("group".len()) } else { 0 };
         let mode_w  = if app.visible_extras.mode { formatted.iter().map(|f| f.mode_s.len()).max().unwrap_or(0).max(5) } else { 0 };
         let extra_w = [uid_w, gid_w, mode_w].iter().filter(|&&w| w > 0).map(|&w| w + 2).sum::<usize>();
         let stat_cols = size_w + count_w + ts_w + extra_w + 6;
@@ -2637,9 +2700,9 @@ fn render_tree_content(f: &mut Frame, app: &App, area: Rect) {
             count_w = count_w,
             ts_w = ts_w,
         );
-        if app.visible_extras.uid  { col_header += &format!("  {:>uid_w$}",  "uid",  uid_w  = uid_w);  }
-        if app.visible_extras.gid  { col_header += &format!("  {:>gid_w$}",  "gid",  gid_w  = gid_w);  }
-        if app.visible_extras.mode { col_header += &format!("  {:>mode_w$}", "mode", mode_w = mode_w); }
+        if app.visible_extras.uid  { col_header += &format!("  {:>uid_w$}",  "user",  uid_w  = uid_w);  }
+        if app.visible_extras.gid  { col_header += &format!("  {:>gid_w$}",  "group", gid_w  = gid_w);  }
+        if app.visible_extras.mode { col_header += &format!("  {:>mode_w$}", "mode",  mode_w = mode_w); }
 
         // Render block separately so we can split the inner area
         let block = Block::default()
@@ -2838,9 +2901,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
         // Build extras indicator
         let extras: Vec<&str> = [
-            if app.visible_extras.uid  { Some("uid")  } else { None },
-            if app.visible_extras.gid  { Some("gid")  } else { None },
-            if app.visible_extras.mode { Some("mode") } else { None },
+            if app.visible_extras.uid  { Some("user")  } else { None },
+            if app.visible_extras.gid  { Some("group") } else { None },
+            if app.visible_extras.mode { Some("mode")  } else { None },
         ].iter().filter_map(|x| *x).collect();
         let extras_str = if extras.is_empty() {
             String::new()
